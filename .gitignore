@@ -1,0 +1,4 @@
+*.xml
+*.swp
+*.pyc
+credentials.py
