@@ -172,74 +172,81 @@ def calc_stats(ri_vals, pivoted):
     return stats
 
 
-engine = create_engine(dsn, encoding='latin1')
+def run():
+    engine = create_engine(dsn, encoding='latin1')
 
 # get proper units/abbrevs
-sensor_lookup = pd.read_sql("""SELECT s.id sensor_id, CONCAT(p.readable,
-                               COALESCE(CASE WHEN display_unit IS NOT NULL THEN CONCAT(' (', display_unit, ')') ELSE display_unit END,
-                                        CASE WHEN abbreviation = 'None' THEN ''
-                                        ELSE CONCAT(' (', abbreviation, ')') END)) AS unit
-                               FROM sensors s JOIN parameters p ON s.parameter_id = p.id JOIN units u ON p.unit_id = u.id""",
-                               engine)
-sensor_lookup.unit = sensor_lookup.unit.map(lambda s: unicode(s, encoding='latin1'))
-now_time = datetime.now()
-end_time = datetime(now_time.year, now_time.month, 1)
-start_time = end_time - relativedelta(months=1)
+    sensor_lookup = pd.read_sql("""SELECT s.id sensor_id, CONCAT(p.readable,
+                                COALESCE(CASE WHEN display_unit IS NOT NULL THEN CONCAT(' (', display_unit, ')') ELSE display_unit END,
+                                            CASE WHEN abbreviation = 'None' THEN ''
+                                            ELSE CONCAT(' (', abbreviation, ')') END)) AS unit
+                                FROM sensors s JOIN parameters p ON s.parameter_id = p.id JOIN units u ON p.unit_id = u.id""",
+                                engine)
+    sensor_lookup.unit = sensor_lookup.unit.map(lambda s: unicode(s, encoding='latin1'))
+    now_time = datetime.now()
+    end_time = datetime(now_time.year, now_time.month, 1)
+    start_time = end_time - relativedelta(months=1)
 # look for active stations
-st_groups = pd.read_sql("""SELECT s.id, s.code from stations s JOIN
-                         (select distinct station_id from groups_stations) t
-                         ON t.station_id = s.id WHERE s.active AND s.exposed""", engine)
-for (id, station) in st_groups.to_records(index=False):
-    # get sensor groups for each active station
-    s_groups = pd.read_sql("""SELECT group_name FROM groups g
-                                 JOIN groups_stations gs ON g.id = gs.group_id
-                                 WHERE gs.station_id = %s
-                                 AND group_name NOT LIKE '%%ErrorEcho'""", engine, params=(id,))
-    print(s_groups)
-    sg_vals = []
-    stat_arr = []
-    for (grp,) in s_groups.to_records(index=False):
-        path = os.path.join(start_time.strftime('%Y-%m'), grp)
-        # Python 3 has os.makedirs(dir, exist_ok=True) for `mkdir -p` like
-        # functionality, but we want to go for cross-version support
-        print(grp)
-        try:
-            os.makedirs(path)
-        except OSError as exception:
-            if exception.errno != errno.EEXIST:
-                raise
-        # check timestamps!  rails stores in UTC since this mysql config is not TZ aware
-        df = pd.read_sql("""SELECT CONVERT_TZ(o.time, 'UTC', 'Asia/Dubai') time, o.sensor_id, o.quality_id, o.value, s.bin, s.bin * v.bin_size + v.value AS depth
-                                        from observations o
-                                        JOIN groups_sensors gs ON o.sensor_id = gs.sensor_id
-                                        JOIN groups g ON gs.group_id = g.id
-                                        JOIN sensors s ON s.id = gs.sensor_id
-                                        LEFT JOIN variations v ON v.id = s.variation_id
-                              WHERE g.group_name = %s AND o.time >= CONVERT_TZ(%s, 'Asia/Dubai', 'UTC')
-                                     AND o.time < CONVERT_TZ(%s, 'Asia/Dubai', 'UTC')""", engine, params=(grp, start_time.isoformat(),
-                                                                                                            end_time.isoformat()))
+    st_groups = pd.read_sql("""SELECT s.id, s.code from stations s JOIN
+                            (select distinct station_id from groups_stations) t
+                            ON t.station_id = s.id WHERE s.active AND s.exposed""", engine)
+    for (id, station) in st_groups.to_records(index=False):
+        # get sensor groups for each active station
+        s_groups = pd.read_sql("""SELECT group_name FROM groups g
+                                    JOIN groups_stations gs ON g.id = gs.group_id
+                                    WHERE gs.station_id = %s
+                                    AND group_name NOT LIKE '%%ErrorEcho'""", engine, params=(id,))
+        print(s_groups)
+        sg_vals = []
+        stat_arr = []
+        for (grp,) in s_groups.to_records(index=False):
+            path = os.path.join(start_time.strftime('%Y-%m'), grp)
+            # Python 3 has os.makedirs(dir, exist_ok=True) for `mkdir -p` like
+            # functionality, but we want to go for cross-version support
+            print(grp)
+            try:
+                os.makedirs(path)
+            except OSError as exception:
+                if exception.errno != errno.EEXIST:
+                    raise
+            # check timestamps!  rails stores in UTC since this mysql config is not TZ aware
+            df = pd.read_sql("""SELECT CONVERT_TZ(o.time, 'UTC', 'Asia/Dubai') time, o.sensor_id, o.quality_id, o.value, s.bin, s.bin * v.bin_size + v.value AS depth
+                                            from observations o
+                                            JOIN groups_sensors gs ON o.sensor_id = gs.sensor_id
+                                            JOIN groups g ON gs.group_id = g.id
+                                            JOIN sensors s ON s.id = gs.sensor_id
+                                            LEFT JOIN variations v ON v.id = s.variation_id
+                                WHERE g.group_name = %s AND o.time >= CONVERT_TZ(%s, 'Asia/Dubai', 'UTC')
+                                        AND o.time < CONVERT_TZ(%s, 'Asia/Dubai', 'UTC')""", engine, params=(grp, start_time.isoformat(),
+                                                                                                                end_time.isoformat()))
 
-        pivoted, val, interval = pivot_sensor_data(df, grp, sensor_lookup)
-        if pivoted is not None:
-            ri_val, qual_mask, orig_time = reindex_vals(pivoted, interval, start=start_time,
-                                                      end=end_time)
-            # NaN out QCed values
-            vals_masked = ri_val.mask(~qual_mask.fillna(False))
-            vals_masked.columns = vals_masked.columns.get_values()
-            time_merge = pd.concat([orig_time, vals_masked], axis=1)
-            time_merge.index.name = 'Formatted TIME (+04:00)'
-            # can probably use astype(str) instead
-            replace_time = time_merge['Original TIME (+04:00)'].apply(lambda d: str(d)).str.replace('NaT', 'None found')
-            time_merge['Original TIME (+04:00)'] = replace_time
-            time_merge.to_csv(grp + '.csv', encoding='utf-8', na_rep='NAN')
-            # however, show QCed values on plot
-            plot_quality(ri_val, ri_qual, grp, start_time, end_time, path)
-            stat_arr.append(calc_stats(ri_val, pivoted))
+            if grp == 'JOBADCP-Waves':
+                import ipdb; ipdb.set_trace()
 
-    if stat_arr:
-        sensor_stats = pd.concat(stat_arr)
-        sensor_stats.index.name = 'Parameter'
-        print('Writing station ' + station + ' to csv')
-        sensor_stats.to_csv(station + '.csv', encoding='utf-8', na_rep='NAN')
-    else:
-        print('Station %s had no data for this time period' % station)
+            pivoted, val, interval = pivot_sensor_data(df, grp, sensor_lookup)
+            if pivoted is not None:
+                ri_val, qual_mask, orig_time = reindex_vals(pivoted, interval, start=start_time,
+                                                        end=end_time)
+                # NaN out QCed values
+                vals_masked = ri_val.mask(~qual_mask.fillna(False))
+                vals_masked.columns = vals_masked.columns.get_values()
+                time_merge = pd.concat([orig_time, vals_masked], axis=1)
+                time_merge.index.name = 'Formatted TIME (+04:00)'
+                # can probably use astype(str) instead
+                replace_time = time_merge['Original TIME (+04:00)'].apply(lambda d: str(d)).str.replace('NaT', 'None found')
+                time_merge['Original TIME (+04:00)'] = replace_time
+                time_merge.to_csv(grp + '.csv', encoding='utf-8', na_rep='NAN')
+                # however, show QCed values on plot
+                plot_quality(ri_val, ri_qual, grp, start_time, end_time, path)
+                stat_arr.append(calc_stats(ri_val, pivoted))
+
+        if stat_arr:
+            sensor_stats = pd.concat(stat_arr)
+            sensor_stats.index.name = 'Parameter'
+            print('Writing station ' + station + ' to csv')
+            sensor_stats.to_csv(station + '.csv', encoding='utf-8', na_rep='NAN')
+        else:
+            print('Station %s had no data for this time period' % station)
+
+if __name__ == "__main__":
+    run()
